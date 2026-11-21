@@ -9,6 +9,12 @@ use std::time::Duration;
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
     Windows,
+    Maximize {
+        window: u64,
+    },
+    Restore {
+        window: u64,
+    },
     Activate {
         window: u64,
     },

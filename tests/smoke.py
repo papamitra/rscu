@@ -62,6 +62,7 @@ def run_session(binary, renderer, apps, check):
                 if process.poll() is None:
                     try:
                         ctl("stop")
+                        assert not (directory / "control").exists()
                         process.wait(timeout=5)
                     except (AssertionError, subprocess.SubprocessError, ValueError):
                         process.kill()
@@ -110,6 +111,15 @@ def check_input(ctl, directory):
     wait_for(lambda: ctl("screenshot", other)["width"] == 1280)
     ctl("key", other, 22)
     wait_for(lambda: ctl("screenshot", other)["width"] == original["width"])
+    ctl("maximize", other)
+    wait_for(lambda: ctl("screenshot", other)["width"] == 1280)
+    ctl("restore", other)
+    wait_for(lambda: ctl("screenshot", other)["width"] == original["width"])
+    menu = ctl("screenshot", other)
+    ctl("click", menu["image"], menu["width"] // 2, menu["height"] // 2)
+    wait_for(lambda: ctl("screenshot", other)["height"] > menu["height"])
+    ctl("key", other, 1)
+    wait_for(lambda: ctl("screenshot", other)["height"] == menu["height"])
     ctl("activate", main)
     crop = ctl("screenshot", main, "--crop", 200, 160, 100, 100)
     ctl("click", crop["image"], 50, 50)

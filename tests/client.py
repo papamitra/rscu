@@ -13,7 +13,13 @@ def setup(app):
     main.set_child(button)
     other = Gtk.ApplicationWindow(application=app, title="rscu-other")
     other.set_default_size(350, 240)
-    other.set_child(Gtk.Label(label="Unrelated window"))
+    menu = Gtk.MenuButton(label="Open menu")
+    popover = Gtk.Popover()
+    item = Gtk.Button(label="Select item")
+    item.connect("clicked", lambda _: popover.popdown())
+    popover.set_child(item)
+    menu.set_popover(popover)
+    other.set_child(menu)
     other_keys = Gtk.EventControllerKey()
 
     def resize_other(_, key, *_args):

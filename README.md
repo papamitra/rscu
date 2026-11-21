@@ -21,11 +21,13 @@ target/debug/rscu --socket "$dir/control" run \
 ctl() { target/debug/rscu --socket "$dir/control" "$@"; }
 ctl windows
 ctl activate 1
+ctl maximize 1
 ctl screenshot 1
 ctl screenshot 1 --crop 10 20 100 80
 ctl screenshot 1 1
 ctl click 1 30 40
 ctl key 1 30
+ctl restore 1
 ctl stop
 rmdir "$dir"
 ```
@@ -41,6 +43,10 @@ python3 tests/smoke.py
 python3 tests/smoke.py --renderer gles
 ```
 
-Pixman と GLES で、PNG の画素と部分撮影、複数ウィンドウの切り替え、最大化と復元、Wayland と X11 のモーダル、キー入力を検証しました。
+Pixman と GLES で、PNG の画素と部分撮影、複数ウィンドウの切り替え、最大化と復元、Wayland と X11 のメニューとモーダル、キー入力、停止時のソケット削除を検証しました。
 
 検証機の Ubuntu 22.04 と XWayland 22.1.1 では、NVIDIA RTX 6000 Ada での GLES 合成と、専用 XWayland での NVIDIA GLX を確認しました。nanoem の起動、PNG 撮影、最大化と復元、指定座標へのクリック、対象ウィンドウへのキーイベントまで確認しました。検証前後で通常デスクトップのアクティブウィンドウ ID は同じでした。
+
+検証機では `検証用ディレクトリ` の検証用ビルドで、nanoem の File → Save Project As と File → Open Project を操作しました。もとのラボ版ではファイル選択が無効だったため、検証用コピーで `NANOEM_ENABLE_IMGUI_FILE_DIALOG=ON` に設定しています。このビルドは起動直後にメニューバーが撮影範囲から外れる場合があるため、検証時は最大化してから操作しました。撮影とログは同ディレクトリの `evidence/` にあります。
+
+nanoem のメニューバーの同一領域を５回確認した試験では、通常の撮影は PNG ５枚、画像 ID を指定した場合は PNG １枚と `unchanged` ４件でした。この試験ではモデル入力トークン数を計測していません。

@@ -231,6 +231,14 @@ impl Session {
         });
     }
 
+    pub fn set_maximized(&mut self, window: &Window, enabled: bool) {
+        if let Some(toplevel) = window.toplevel() {
+            self.resize_wayland(toplevel.clone(), State::Maximized, enabled);
+        } else if let Some(x11) = window.x11_surface() {
+            self.resize_x11(x11.clone(), enabled, false);
+        }
+    }
+
     fn resize_wayland(&mut self, surface: ToplevelSurface, flag: State, enabled: bool) {
         let entry = self
             .windows

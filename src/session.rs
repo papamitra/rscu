@@ -713,6 +713,15 @@ impl Session {
                 self.refresh();
                 Ok(json!({"focus":self.focused}))
             }
+            Request::Maximize { window } | Request::Restore { window } => {
+                let entry = self
+                    .entry(window)
+                    .filter(|entry| Self::listed(entry))
+                    .ok_or("unknown or unmapped window")?;
+                let target = entry.window.clone();
+                self.set_maximized(&target, matches!(request, Request::Maximize { .. }));
+                Ok(json!({"sent":true}))
+            }
             Request::Screenshot {
                 window,
                 since,
@@ -751,7 +760,7 @@ pub fn run(
     let wayland_path = dir.path().join("wayland");
     let listener = ListeningSocket::bind_absolute(wayland_path.clone())?;
     let control = UnixListener::bind(socket)?;
-    let _socket_guard = SocketGuard(socket.to_path_buf());
+    let socket_guard = SocketGuard(socket.to_path_buf());
     control.set_nonblocking(true)?;
     std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
     let capture_dir = dir.path().to_path_buf();
@@ -780,6 +789,7 @@ pub fn run(
     eprintln!("Wayland socket: {}", wayland_path.display());
     eprintln!("Control socket: {}", socket.display());
     let mut click_reply: Option<(UnixStream, Value)> = None;
+    let mut stop_reply = None;
     while !state.stopped {
         event_loop.dispatch(Duration::from_millis(16), &mut state)?;
         while let Some(client) = listener.accept()? {
@@ -843,7 +853,9 @@ pub fn run(
                 .map_err(Into::into)
                 .and_then(|request| state.request(request))
                 .unwrap_or_else(|error| json!({"error":error.to_string()}));
-            if state.click_step.is_some() {
+            if state.stopped {
+                stop_reply = Some((stream, response));
+            } else if state.click_step.is_some() {
                 click_reply = Some((stream, response));
             } else {
                 let _ = serde_json::to_writer(stream, &response);
@@ -854,6 +866,17 @@ pub fn run(
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         state.frame();
         display.flush_clients()?;
+    }
+    drop(state);
+    drop(xserver);
+    drop(event_loop);
+    drop(display);
+    drop(control);
+    drop(socket_guard);
+    drop(listener);
+    dir.close()?;
+    if let Some((stream, response)) = stop_reply {
+        let _ = serde_json::to_writer(stream, &response);
     }
     Ok(())
 }

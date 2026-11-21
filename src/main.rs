@@ -9,7 +9,7 @@ use control::Request;
 use std::{ffi::OsString, path::PathBuf};
 
 const USAGE: &str = "Usage: rscu --socket PATH run [--renderer pixman|gles] [--wayland APP [ARGS...] [--wayland APP ...]] [--x11 APP [ARGS...] ...]
-       rscu --socket PATH windows | activate ID | screenshot ID [SINCE] [--crop X Y W H] | click IMAGE X Y | key ID EVDEV [MODIFIER...] | stop";
+       rscu --socket PATH windows | activate ID | maximize ID | restore ID | screenshot ID [SINCE] [--crop X Y W H] | click IMAGE X Y | key ID EVDEV [MODIFIER...] | stop";
 
 fn main() {
     if let Err(error) = run() {
@@ -65,6 +65,12 @@ fn run() -> session::Result<()> {
     }
     let request = match (action.to_str(), rest) {
         (Some("windows"), []) => Request::Windows,
+        (Some("maximize"), [window]) => Request::Maximize {
+            window: number(window)?,
+        },
+        (Some("restore"), [window]) => Request::Restore {
+            window: number(window)?,
+        },
         (Some("activate"), [window]) => Request::Activate {
             window: number(window)?,
         },
