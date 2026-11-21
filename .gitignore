@@ -2,3 +2,4 @@ COMPUTER_USE_HADOFF.md
 AGENTS.md
 
 /target/
+__pycache__/

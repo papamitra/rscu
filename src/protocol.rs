@@ -77,7 +77,7 @@ impl CompositorHandler for Session {
             if let Some(entry) = self
                 .windows
                 .iter()
-                .find(|e| Session::surface(&e.window).as_ref() == Some(&root))
+                .find(|e| e.window.surface().as_ref() == Some(&root))
             {
                 entry.window.on_commit();
                 if let Some(toplevel) = entry.window.toplevel()
@@ -219,7 +219,7 @@ impl Session {
             .and_then(|surface| {
                 self.windows
                     .iter()
-                    .find(|e| Self::surface(&e.window).as_ref() == Some(&surface))
+                    .find(|e| e.window.surface().as_ref() == Some(&surface))
             })
             .and_then(|entry| self.space.element_location(&entry.window))
             .unwrap_or_default();
@@ -236,11 +236,17 @@ impl Session {
             .windows
             .iter_mut()
             .find(|entry| entry.window.toplevel() == Some(&surface));
+        let restore = entry.map(|entry| {
+            if enabled {
+                let geometry = entry.window.geometry();
+                if geometry.size.w > 0 && geometry.size.h > 0 {
+                    entry.restore.get_or_insert(geometry);
+                }
+            }
+            &mut entry.restore
+        });
         surface.with_pending_state(|state| {
             if enabled {
-                if let Some(entry) = entry {
-                    entry.restore.get_or_insert(entry.window.geometry());
-                }
                 state.states.set(flag);
                 state.size = Some(SIZE.into());
             } else {
@@ -248,9 +254,7 @@ impl Session {
                 if !state.states.contains(State::Maximized)
                     && !state.states.contains(State::Fullscreen)
                 {
-                    state.size = entry
-                        .and_then(|entry| entry.restore.take())
-                        .map(|rect| rect.size);
+                    state.size = restore.and_then(Option::take).map(|rect| rect.size);
                 }
             }
         });

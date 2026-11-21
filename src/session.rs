@@ -2,6 +2,7 @@ use crate::{
     control::{self, Request},
     focus::KeyboardFocus,
     render::{Backend, Renderer},
+    window::SceneWindow,
 };
 use serde_json::{Value, json};
 use smithay::{
@@ -9,7 +10,7 @@ use smithay::{
         input::{ButtonState, KeyState},
         renderer::buffer_dimensions,
     },
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{PopupManager, Space, Window, space::SpaceElement},
     input::{
         Seat, SeatState,
         keyboard::FilterResult,
@@ -19,7 +20,7 @@ use smithay::{
     reexports::{
         calloop::EventLoop,
         wayland_server::{
-            Display, DisplayHandle, ListeningSocket, protocol::wl_surface::WlSurface,
+            Client, Display, DisplayHandle, ListeningSocket, protocol::wl_surface::WlSurface,
         },
     },
     utils::{IsAlive, Logical, Rectangle, SERIAL_COUNTER, Transform},
@@ -30,7 +31,7 @@ use smithay::{
         shell::xdg::{XdgShellState, XdgToplevelSurfaceData},
         shm::ShmState,
     },
-    xwayland::{X11Wm, XWayland, XWaylandEvent},
+    xwayland::{X11Wm, XWayland},
 };
 use std::{
     collections::VecDeque,
@@ -38,7 +39,7 @@ use std::{
     fs::File,
     hash::{DefaultHasher, Hash, Hasher},
     io,
-    os::unix::net::UnixListener,
+    os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -50,8 +51,9 @@ pub const SIZE: (i32, i32) = (1280, 800);
 
 pub struct Entry {
     pub id: u64,
-    pub window: Window,
+    pub window: SceneWindow,
     pub restore: Option<Rectangle<i32, Logical>>,
+    pub popup_owner: Option<u64>,
 }
 
 struct Capture {
@@ -73,8 +75,9 @@ pub struct Session {
     pub seat: Seat<Self>,
     pub popups: PopupManager,
     pub windows: Vec<Entry>,
-    pub space: Space<Window>,
+    pub space: Space<SceneWindow>,
     pub xwm: Option<X11Wm>,
+    xwayland_client: Option<Client>,
     x11_properties: Option<X11Properties>,
     pub xwayland_shell: smithay::wayland::xwayland_shell::XWaylandShellState,
     pub output: Output,
@@ -89,14 +92,18 @@ pub struct Session {
     capture_dir: PathBuf,
     start: Instant,
     stopped: bool,
-    startup_error: Option<String>,
+    click_step: Option<(Instant, ButtonState, u64)>,
     children: Vec<Child>,
 }
 
 impl Session {
     fn new(dh: DisplayHandle, capture_dir: PathBuf, backend: Backend) -> Result<Self> {
         let compositor = CompositorState::new::<Self>(&dh);
-        let xdg = XdgShellState::new::<Self>(&dh);
+        use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::WmCapabilities;
+        let xdg = XdgShellState::new_with_capabilities::<Self>(
+            &dh,
+            [WmCapabilities::Maximize, WmCapabilities::Fullscreen],
+        );
         smithay::wayland::shell::xdg::dialog::XdgDialogState::new::<Self>(&dh);
         let shm = ShmState::new::<Self>(&dh, vec![]);
         let xwayland_shell = smithay::wayland::xwayland_shell::XWaylandShellState::new::<Self>(&dh);
@@ -145,6 +152,7 @@ impl Session {
             windows: Vec::new(),
             space,
             xwm: None,
+            xwayland_client: None,
             x11_properties: None,
             xwayland_shell,
             output,
@@ -159,18 +167,51 @@ impl Session {
             capture_dir,
             start: Instant::now(),
             stopped: false,
-            startup_error: None,
+            click_step: None,
             children: Vec::new(),
         })
     }
 
     pub fn insert(&mut self, window: Window) {
+        let popup_owner = window
+            .x11_surface()
+            .filter(|x11| x11.is_override_redirect())
+            .and_then(|popup| self.x11_popup_owner(popup));
         self.windows.push(Entry {
             id: self.next_window,
-            window,
+            window: window.into(),
             restore: None,
+            popup_owner,
         });
         self.next_window += 1;
+    }
+
+    fn x11_popup_owner(&self, popup: &smithay::xwayland::X11Surface) -> Option<u64> {
+        let properties = self.x11_properties.as_ref()?;
+        if let Some(transient_for) = popup.is_transient_for()
+            && let Some(owner) = self.windows.iter().find(|e| {
+                e.window
+                    .x11_surface()
+                    .is_some_and(|x| x.window_id() == transient_for)
+            })
+        {
+            return Some(owner.id);
+        }
+        let belongs_to = |entry: &&Entry| {
+            entry.window.x11_surface().is_some_and(|x| {
+                !x.is_override_redirect()
+                    && properties.same_client(popup.window_id(), x.window_id())
+            })
+        };
+        self.focused
+            .and_then(|id| self.entry(id))
+            .filter(belongs_to)
+            .map(|entry| entry.id)
+            .or_else(|| {
+                let mut owners = self.windows.iter().filter(belongs_to);
+                let owner = owners.next()?;
+                owners.next().is_none().then_some(owner.id)
+            })
     }
 
     fn entry(&self, id: u64) -> Option<&Entry> {
@@ -180,21 +221,40 @@ impl Session {
     pub fn focus_matches(&self, surface: &WlSurface) -> bool {
         self.focused
             .and_then(|id| self.entry(id))
-            .and_then(|e| Self::surface(&e.window))
+            .and_then(|e| e.window.surface())
             .as_ref()
             == Some(surface)
     }
 
-    pub fn surface(window: &Window) -> Option<WlSurface> {
-        if let Some(toplevel) = window.toplevel() {
-            Some(toplevel.wl_surface().clone())
-        } else {
-            window.x11_surface()?.wl_surface()
+    // Look up legacy IDs only inside the client connection created by XWayland.
+    #[allow(deprecated)]
+    fn associate_legacy_surfaces(&mut self) {
+        let Some(client) = &self.xwayland_client else {
+            return;
+        };
+        for entry in &mut self.windows {
+            let Some(x11) = entry.window.x11_surface() else {
+                continue;
+            };
+            let surface = if x11.wl_surface().is_none() {
+                x11.wl_surface_id()
+                    .and_then(|id| client.object_from_protocol_id(&self.dh, id).ok())
+            } else {
+                None
+            };
+            if entry.window.legacy_surface != surface {
+                self.space.unmap_elem(&entry.window);
+                entry.window.legacy_surface = surface;
+                self.epoch += 1;
+                if self.focused == Some(entry.id) {
+                    self.focused = None;
+                }
+            }
         }
     }
 
-    fn mapped(window: &Window) -> bool {
-        Self::surface(window).is_some_and(|surface| {
+    fn mapped(window: &SceneWindow) -> bool {
+        window.surface().is_some_and(|surface| {
             smithay::backend::renderer::utils::with_renderer_surface_state(&surface, |state| {
                 state
                     .buffer()
@@ -211,7 +271,7 @@ impl Session {
             return self
                 .windows
                 .iter()
-                .find(|e| Self::surface(&e.window).as_ref() == Some(&parent))
+                .find(|e| e.window.surface().as_ref() == Some(&parent))
                 .map(|e| e.id);
         }
         let x11 = entry.window.x11_surface()?;
@@ -246,7 +306,7 @@ impl Session {
                 .as_ref()
                 .is_some_and(|props| props.is_modal(x11.window_id()));
         }
-        Self::surface(&entry.window).is_some_and(|surface| {
+        entry.window.surface().is_some_and(|surface| {
             with_states(&surface, |states| {
                 states
                     .data_map
@@ -261,7 +321,7 @@ impl Session {
         let title = if let Some(x11) = entry.window.x11_surface() {
             Some(x11.title())
         } else {
-            Self::surface(&entry.window).and_then(|surface| {
+            entry.window.surface().and_then(|surface| {
                 with_states(&surface, |states| {
                     states
                         .data_map
@@ -287,9 +347,8 @@ impl Session {
 
     fn refresh(&mut self) {
         self.windows.retain(|entry| entry.window.alive());
-        let chosen = self
-            .selected
-            .filter(|id| self.entry(*id).is_some_and(Self::listed));
+        self.associate_legacy_surfaces();
+        let chosen = self.selected.filter(|id| self.entry(*id).is_some());
         let chosen = chosen.or_else(|| {
             self.focused
                 .and_then(|id| self.entry(id))
@@ -312,23 +371,16 @@ impl Session {
             .windows
             .iter()
             .filter(|e| {
-                Self::mapped(&e.window)
-                    && (Some(self.root(e.id)) == family
-                        || (e
-                            .window
-                            .x11_surface()
-                            .is_some_and(|x| x.is_override_redirect())
-                            && family
-                                .and_then(|id| self.entry(id))
-                                .and_then(|root| root.window.x11_surface())
-                                .is_some_and(|x| {
-                                    e.window
-                                        .x11_surface()
-                                        .unwrap()
-                                        .pid()
-                                        .zip(x.pid())
-                                        .is_some_and(|(a, b)| a == b)
-                                })))
+                let override_redirect = e
+                    .window
+                    .x11_surface()
+                    .is_some_and(|x| x.is_override_redirect());
+                let root = if override_redirect {
+                    e.popup_owner.map(|owner| self.root(owner))
+                } else {
+                    Some(self.root(e.id))
+                };
+                Self::mapped(&e.window) && family.is_some() && root == family
             })
             .map(|e| (e.id, e.window.clone(), self.parent(e).is_some()))
             .collect();
@@ -339,6 +391,9 @@ impl Session {
             .filter(|w| !visible.iter().any(|(_, v, _)| v == *w))
             .cloned()
             .collect();
+        if !hidden.is_empty() {
+            self.epoch += 1;
+        }
         for window in hidden {
             self.space.unmap_elem(&window);
         }
@@ -352,7 +407,14 @@ impl Session {
                 (0, 0).into()
             };
             if self.space.element_location(window) != Some(loc) {
+                let popup = window
+                    .x11_surface()
+                    .is_some_and(|x| x.is_override_redirect());
                 self.space.map_element(window.clone(), loc, false);
+                if popup {
+                    self.space.raise_element(window, false);
+                }
+                self.epoch += 1;
             }
         }
         let target = visible
@@ -383,7 +445,7 @@ impl Session {
         self.epoch += 1;
         self.focused = target;
         let surface = target.and_then(|id| self.entry(id)).and_then(|entry| {
-            let surface = Self::surface(&entry.window)?;
+            let surface = entry.window.surface()?;
             Some(match entry.window.x11_surface() {
                 Some(x11) => KeyboardFocus::X11(Box::new(x11.clone()), surface),
                 None => KeyboardFocus::Wayland(surface),
@@ -403,10 +465,18 @@ impl Session {
                     });
                     toplevel.send_pending_configure();
                 }
-            } else if let Some(x11) = entry.window.x11_surface() {
-                let _ = x11.set_activated(Some(entry.id) == target);
             }
         }
+        pointer.motion(
+            self,
+            None,
+            &MotionEvent {
+                location: pointer.current_location(),
+                serial,
+                time,
+            },
+        );
+        pointer.frame(self);
         if let Some(window) = target
             .and_then(|id| self.entry(id))
             .map(|e| e.window.clone())
@@ -420,12 +490,7 @@ impl Session {
 
     fn frame(&self) {
         for entry in &self.windows {
-            entry.window.send_frame(
-                &self.output,
-                self.start.elapsed(),
-                Some(Duration::ZERO),
-                |_, _| Some(self.output.clone()),
-            );
+            entry.window.send_frame(&self.output, self.start.elapsed());
         }
     }
 
@@ -436,7 +501,18 @@ impl Session {
             .element_location(&entry.window)
             .ok_or("activate the window first")?;
         let mut area = entry.window.bbox_with_popups();
-        area.loc += location - entry.window.geometry().loc;
+        area.loc += location - SpaceElement::geometry(&entry.window).loc;
+        for popup in self
+            .windows
+            .iter()
+            .filter(|popup| popup.popup_owner == Some(entry.id))
+        {
+            if let Some(location) = self.space.element_location(&popup.window) {
+                let mut bounds = popup.window.bbox_with_popups();
+                bounds.loc += location - SpaceElement::geometry(&popup.window).loc;
+                area = area.merge(bounds);
+            }
+        }
         area.intersection(Rectangle::from_size(SIZE.into()))
             .ok_or_else(|| "window is outside the virtual output".into())
     }
@@ -521,9 +597,10 @@ impl Session {
         }
         let position = (capture.area.loc + smithay::utils::Point::from((x, y))).to_f64();
         let focus = self.space.elements().rev().find_map(|window| {
-            let location = self.space.element_location(window)? - window.geometry().loc;
+            let location =
+                self.space.element_location(window)? - SpaceElement::geometry(window).loc;
             window
-                .surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
+                .surface_under(position - location.to_f64())
                 .map(|(surface, offset)| (surface, (offset + location).to_f64()))
         });
         let pointer = self.seat.get_pointer().unwrap();
@@ -540,32 +617,57 @@ impl Session {
                 time,
             },
         );
-        for state in [ButtonState::Pressed, ButtonState::Released] {
-            pointer.button(
-                self,
-                &ButtonEvent {
-                    serial: SERIAL_COUNTER.next_serial(),
-                    time,
-                    button: 0x110,
-                    state,
-                },
-            );
-            pointer.frame(self);
-        }
+        pointer.frame(self);
+        // XWayland must process the motion before the button event. Keep the
+        // button pressed across a client frame for immediate-mode toolkits.
+        self.click_step = Some((
+            Instant::now() + Duration::from_millis(16),
+            ButtonState::Pressed,
+            self.epoch,
+        ));
         self.log(json!({"click":[x,y],"image":image}));
         Ok(json!({"sent":true}))
     }
 
-    fn key(&mut self, window: u64, code: u32) -> Result<Value> {
+    fn left_button(&mut self, state: ButtonState) {
+        let pointer = self.seat.get_pointer().expect("virtual pointer");
+        pointer.button(
+            self,
+            &ButtonEvent {
+                serial: SERIAL_COUNTER.next_serial(),
+                time: self.start.elapsed().as_millis() as u32,
+                button: 0x110,
+                state,
+            },
+        );
+        pointer.frame(self);
+    }
+
+    fn key(&mut self, window: u64, code: u32, modifiers: Vec<u32>) -> Result<Value> {
         if self.focused != Some(window) {
             return Err("key target does not have focus".into());
         }
         if !(1..=247).contains(&code) {
             return Err("expected an evdev key code from 1 to 247".into());
         }
-        let keyboard = self.seat.get_keyboard().unwrap();
+        for (index, modifier) in modifiers.iter().enumerate() {
+            if !matches!(modifier, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126)
+                || *modifier == code
+                || modifiers[..index].contains(modifier)
+            {
+                return Err(
+                    "expected distinct evdev Shift, Ctrl, Alt or Meta modifier codes".into(),
+                );
+            }
+        }
+        let keyboard = self.seat.get_keyboard().expect("virtual keyboard");
         let time = self.start.elapsed().as_millis() as u32;
-        for state in [KeyState::Pressed, KeyState::Released] {
+        let chord = modifiers.iter().copied().chain([code]);
+        for (code, state) in chord
+            .clone()
+            .map(|code| (code, KeyState::Pressed))
+            .chain(chord.rev().map(|code| (code, KeyState::Released)))
+        {
             keyboard.input::<(), _>(
                 self,
                 (code + 8).into(),
@@ -575,7 +677,7 @@ impl Session {
                 |_, _, _| FilterResult::Forward,
             );
         }
-        self.log(json!({"key":code,"window":window}));
+        self.log(json!({"key":code,"modifiers":modifiers,"window":window}));
         Ok(json!({"sent":true}))
     }
 
@@ -617,7 +719,11 @@ impl Session {
                 crop,
             } => self.screenshot(window, since, crop),
             Request::Click { image, x, y } => self.click(image, x, y),
-            Request::Key { window, code } => self.key(window, code),
+            Request::Key {
+                window,
+                code,
+                modifiers,
+            } => self.key(window, code, modifiers),
             Request::Stop => {
                 self.stopped = true;
                 Ok(json!({"stopped":true}))
@@ -655,55 +761,25 @@ pub fn run(
     for app in apps.drain(..) {
         state.children.push(launch(&app, &wayland_path, None)?);
     }
-    if !x11.is_empty() {
-        let (server, xwayland_client) = XWayland::spawn(
+    let mut xserver = if x11.is_empty() {
+        None
+    } else {
+        let (server, client) = XWayland::spawn(
             &state.dh,
-            None,
+            Some(free_x11_display()?),
             std::iter::empty::<(&str, &str)>(),
-            false,
+            true,
             Stdio::null(),
             Stdio::inherit(),
             |_| (),
         )?;
-        let handle = event_loop.handle();
-        let xwm_handle = handle.clone();
-        let child_wayland = wayland_path.clone();
-        handle
-            .insert_source(server, move |event, _, state| match event {
-                XWaylandEvent::Ready {
-                    x11_socket,
-                    display_number,
-                } => {
-                    let result = (|| -> Result<()> {
-                        state.xwm = Some(X11Wm::start_wm(
-                            xwm_handle.clone(),
-                            x11_socket,
-                            xwayland_client.clone(),
-                        )?);
-                        state.x11_properties = Some(X11Properties::connect(display_number)?);
-                        for app in x11.drain(..) {
-                            state.children.push(launch(
-                                &app,
-                                &child_wayland,
-                                Some(display_number),
-                            )?);
-                        }
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        state.startup_error = Some(format!("XWayland: {error}"));
-                        state.stopped = true;
-                    }
-                }
-                XWaylandEvent::Error => {
-                    state.startup_error = Some("XWayland failed to start".into());
-                    state.stopped = true;
-                }
-            })
-            .map_err(|error| io::Error::other(error.to_string()))?;
-    }
+        state.xwayland_client = Some(client);
+        Some(server)
+    };
+    let xwayland_deadline = Instant::now() + Duration::from_secs(15);
     eprintln!("Wayland socket: {}", wayland_path.display());
     eprintln!("Control socket: {}", socket.display());
+    let mut click_reply: Option<(UnixStream, Value)> = None;
     while !state.stopped {
         event_loop.dispatch(Duration::from_millis(16), &mut state)?;
         while let Some(client) = listener.accept()? {
@@ -712,14 +788,66 @@ pub fn run(
                 .insert_client(client, Arc::new(crate::protocol::WaylandClient::default()))?;
         }
         display.dispatch_clients(&mut state)?;
+        if state.xwm.is_none()
+            && let Some(server) = &mut xserver
+        {
+            if let Some(x11_socket) = server.take_socket()? {
+                let display_number = server.display_number();
+                let client = state
+                    .xwayland_client
+                    .clone()
+                    .expect("registered XWayland client");
+                eprintln!("XWayland: :{display_number}");
+                state.xwm = Some(X11Wm::start_wm(event_loop.handle(), x11_socket, client)?);
+                state.x11_properties = Some(X11Properties::connect(display_number)?);
+                for app in x11.drain(..) {
+                    state
+                        .children
+                        .push(launch(&app, &wayland_path, Some(display_number))?);
+                }
+            } else if Instant::now() >= xwayland_deadline {
+                return Err("timed out starting XWayland".into());
+            }
+        }
+
         state.refresh();
-        if let Ok((stream, _)) = control.accept() {
+        if let Some((deadline, button, epoch)) = state.click_step
+            && Instant::now() >= deadline
+        {
+            state.click_step = None;
+            if button == ButtonState::Pressed && state.epoch != epoch {
+                if let Some((_, response)) = &mut click_reply {
+                    *response = json!({"error":"target changed during pointer motion; take another screenshot"});
+                }
+            } else {
+                state.left_button(button);
+                if button == ButtonState::Pressed {
+                    state.click_step = Some((
+                        Instant::now() + Duration::from_millis(45),
+                        ButtonState::Released,
+                        epoch,
+                    ));
+                }
+            }
+        }
+        if state.click_step.is_none()
+            && let Some((stream, response)) = click_reply.take()
+        {
+            let _ = serde_json::to_writer(stream, &response);
+        }
+        if click_reply.is_none()
+            && let Ok((stream, _)) = control.accept()
+        {
             control::configure(&stream)?;
             let response = control::read_request(&stream)
                 .map_err(Into::into)
                 .and_then(|request| state.request(request))
                 .unwrap_or_else(|error| json!({"error":error.to_string()}));
-            let _ = serde_json::to_writer(stream, &response);
+            if state.click_step.is_some() {
+                click_reply = Some((stream, response));
+            } else {
+                let _ = serde_json::to_writer(stream, &response);
+            }
         }
         state
             .children
@@ -727,10 +855,27 @@ pub fn run(
         state.frame();
         display.flush_clients()?;
     }
-    if let Some(error) = state.startup_error.take() {
-        return Err(error.into());
-    }
     Ok(())
+}
+
+fn free_x11_display() -> Result<u32> {
+    // Smithay can reuse a display with no lock file. Desktop servers can
+    // occupy only the abstract socket, so also check both socket namespaces.
+    let unix_sockets = std::fs::read_to_string("/proc/net/unix")?;
+    (64..128)
+        .find(|number| {
+            let path = format!("/tmp/.X11-unix/X{number}");
+            let lock = format!("/tmp/.X{number}-lock");
+            let abstract_path = format!("@{path}");
+            !Path::new(&lock).exists()
+                && !Path::new(&path).exists()
+                && !unix_sockets.lines().any(|line| {
+                    line.split_whitespace()
+                        .last()
+                        .is_some_and(|socket| socket == path || socket == abstract_path)
+                })
+        })
+        .ok_or_else(|| "no free dedicated X11 display in :64 through :127".into())
 }
 
 fn launch(args: &[OsString], wayland: &Path, x11: Option<u32>) -> io::Result<Child> {
@@ -779,6 +924,12 @@ impl X11Properties {
             state,
             modal,
         })
+    }
+
+    fn same_client(&self, left: u32, right: u32) -> bool {
+        use x11rb::connection::Connection;
+        let client_mask = !self.connection.setup().resource_id_mask;
+        left & client_mask == right & client_mask
     }
 
     fn is_modal(&self, window: u32) -> bool {

@@ -25,6 +25,8 @@ pub enum Request {
     Key {
         window: u64,
         code: u32,
+        #[serde(default)]
+        modifiers: Vec<u32>,
     },
     Stop,
 }

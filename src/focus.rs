@@ -60,6 +60,10 @@ impl KeyboardTarget<Session> for KeyboardFocus {
     ) {
         match self {
             Self::Wayland(surface) => KeyboardTarget::enter(surface, seat, state, keys, serial),
+            Self::X11(window, surface) if window.wl_surface().is_none() => {
+                window.enter(seat, state, Vec::new(), serial);
+                KeyboardTarget::enter(surface, seat, state, keys, serial);
+            }
             Self::X11(window, _) => window.enter(seat, state, keys, serial),
         }
     }
@@ -67,7 +71,12 @@ impl KeyboardTarget<Session> for KeyboardFocus {
     fn leave(&self, seat: &Seat<Session>, state: &mut Session, serial: Serial) {
         match self {
             Self::Wayland(surface) => KeyboardTarget::leave(surface, seat, state, serial),
-            Self::X11(window, _) => window.leave(seat, state, serial),
+            Self::X11(window, surface) => {
+                window.leave(seat, state, serial);
+                if window.wl_surface().is_none() {
+                    KeyboardTarget::leave(surface, seat, state, serial);
+                }
+            }
         }
     }
 
@@ -82,6 +91,9 @@ impl KeyboardTarget<Session> for KeyboardFocus {
     ) {
         match self {
             Self::Wayland(surface) => surface.key(seat, state, key, key_state, serial, time),
+            Self::X11(window, surface) if window.wl_surface().is_none() => {
+                surface.key(seat, state, key, key_state, serial, time)
+            }
             Self::X11(window, _) => window.key(seat, state, key, key_state, serial, time),
         }
     }
@@ -95,6 +107,9 @@ impl KeyboardTarget<Session> for KeyboardFocus {
     ) {
         match self {
             Self::Wayland(surface) => surface.modifiers(seat, state, modifiers, serial),
+            Self::X11(window, surface) if window.wl_surface().is_none() => {
+                surface.modifiers(seat, state, modifiers, serial)
+            }
             Self::X11(window, _) => window.modifiers(seat, state, modifiers, serial),
         }
     }

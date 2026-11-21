@@ -3,12 +3,13 @@ mod focus;
 mod protocol;
 mod render;
 mod session;
+mod window;
 
 use control::Request;
 use std::{ffi::OsString, path::PathBuf};
 
 const USAGE: &str = "Usage: rscu --socket PATH run [--renderer pixman|gles] [--wayland APP [ARGS...] [--wayland APP ...]] [--x11 APP [ARGS...] ...]
-       rscu --socket PATH windows | activate ID | screenshot ID [SINCE] [--crop X Y W H] | click IMAGE X Y | key ID EVDEV | stop";
+       rscu --socket PATH windows | activate ID | screenshot ID [SINCE] [--crop X Y W H] | click IMAGE X Y | key ID EVDEV [MODIFIER...] | stop";
 
 fn main() {
     if let Err(error) = run() {
@@ -91,9 +92,13 @@ fn run() -> session::Result<()> {
             x: number(x)?,
             y: number(y)?,
         },
-        (Some("key"), [window, code]) => Request::Key {
+        (Some("key"), [window, code, modifiers @ ..]) => Request::Key {
             window: number(window)?,
             code: number(code)?,
+            modifiers: modifiers
+                .iter()
+                .map(number)
+                .collect::<session::Result<_>>()?,
         },
         (Some("stop"), []) => Request::Stop,
         _ => return Err(USAGE.into()),

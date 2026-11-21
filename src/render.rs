@@ -1,4 +1,7 @@
-use crate::session::{Result, SIZE, Session};
+use crate::{
+    session::{Result, SIZE, Session},
+    window::SceneWindow,
+};
 use smithay::{
     backend::{
         allocator::{Fourcc, dmabuf::Dmabuf},
@@ -11,7 +14,7 @@ use smithay::{
             pixman::PixmanRenderer,
         },
     },
-    desktop::{Space, Window, space::render_output},
+    desktop::{Space, space::render_output},
     output::Output,
     reexports::wayland_server::DisplayHandle,
     utils::{Logical, Rectangle},
@@ -117,7 +120,7 @@ impl Renderer {
     pub fn capture(
         &mut self,
         output: &Output,
-        space: &Space<Window>,
+        space: &Space<SceneWindow>,
         area: Rectangle<i32, Logical>,
     ) -> Result<Vec<u8>> {
         match self {
@@ -138,7 +141,7 @@ impl Renderer {
 fn capture<R, T>(
     renderer: &mut R,
     output: &Output,
-    space: &Space<Window>,
+    space: &Space<SceneWindow>,
     area: Rectangle<i32, Logical>,
     format: Fourcc,
 ) -> Result<Vec<u8>>
