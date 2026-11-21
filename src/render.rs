@@ -9,7 +9,7 @@ use smithay::{
         renderer::{
             ExportMem, ImportAll, ImportDma, ImportEgl, Offscreen, Texture,
             damage::OutputDamageTracker,
-            element::surface::WaylandSurfaceRenderElement,
+            element::{AsRenderElements, surface::WaylandSurfaceRenderElement},
             gles::{GlesRenderbuffer, GlesRenderer, ffi},
             pixman::PixmanRenderer,
         },
@@ -17,7 +17,7 @@ use smithay::{
     desktop::{Space, space::render_output},
     output::Output,
     reexports::wayland_server::DisplayHandle,
-    utils::{Logical, Rectangle},
+    utils::{Logical, Point, Rectangle},
     wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState},
 };
 use std::{ffi::CStr, os::unix::fs::MetadataExt, path::PathBuf};
@@ -124,13 +124,40 @@ impl Renderer {
         area: Rectangle<i32, Logical>,
     ) -> Result<Vec<u8>> {
         match self {
-            Self::Pixman(renderer) => {
-                capture(renderer.as_mut(), output, space, area, Fourcc::Xrgb8888)
-            }
+            Self::Pixman(renderer) => capture(
+                renderer.as_mut(),
+                output,
+                Scene::Active(space),
+                area,
+                Fourcc::Xrgb8888,
+            ),
             Self::Gles(renderer) => capture::<_, GlesRenderbuffer>(
                 renderer.as_mut(),
                 output,
-                space,
+                Scene::Active(space),
+                area,
+                Fourcc::Abgr8888,
+            ),
+        }
+    }
+    pub fn capture_group(
+        &mut self,
+        output: &Output,
+        group: &[(SceneWindow, Point<i32, Logical>)],
+        area: Rectangle<i32, Logical>,
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Pixman(renderer) => capture(
+                renderer.as_mut(),
+                output,
+                Scene::Group(group),
+                area,
+                Fourcc::Xrgb8888,
+            ),
+            Self::Gles(renderer) => capture::<_, GlesRenderbuffer>(
+                renderer.as_mut(),
+                output,
+                Scene::Group(group),
                 area,
                 Fourcc::Abgr8888,
             ),
@@ -138,10 +165,15 @@ impl Renderer {
     }
 }
 
+enum Scene<'a> {
+    Active(&'a Space<SceneWindow>),
+    Group(&'a [(SceneWindow, Point<i32, Logical>)]),
+}
+
 fn capture<R, T>(
     renderer: &mut R,
     output: &Output,
-    space: &Space<SceneWindow>,
+    scene: Scene<'_>,
     area: Rectangle<i32, Logical>,
     format: Fourcc,
 ) -> Result<Vec<u8>>
@@ -153,19 +185,43 @@ where
     let mut buffer = renderer.create_buffer(format, SIZE.into())?;
     let mut target = renderer.bind(&mut buffer)?;
     let mut tracker = OutputDamageTracker::from_output(output);
-    render_output::<_, WaylandSurfaceRenderElement<R>, _, _>(
-        output,
-        renderer,
-        &mut target,
-        1.0,
-        0,
-        [space],
-        &[],
-        &mut tracker,
-        [0.0, 0.0, 0.0, 1.0],
-    )?
-    .sync
-    .wait()?;
+    let clear = [0.0, 0.0, 0.0, 1.0];
+    let sync = match scene {
+        Scene::Active(space) => {
+            render_output::<_, WaylandSurfaceRenderElement<R>, _, _>(
+                output,
+                renderer,
+                &mut target,
+                1.0,
+                0,
+                [space],
+                &[],
+                &mut tracker,
+                clear,
+            )?
+            .sync
+        }
+        Scene::Group(group) => {
+            let elements: Vec<WaylandSurfaceRenderElement<R>> = group
+                .iter()
+                .rev()
+                .flat_map(|(window, location)| {
+                    let origin =
+                        *location - smithay::desktop::space::SpaceElement::geometry(window).loc;
+                    window.render_elements(
+                        renderer,
+                        origin.to_physical_precise_round(1.0),
+                        1.0.into(),
+                        1.0,
+                    )
+                })
+                .collect();
+            tracker
+                .render_output(renderer, &mut target, 0, &elements, clear)?
+                .sync
+        }
+    };
+    sync.wait()?;
     // With a Normal Smithay transform on an offscreen target, logical row zero
     // is the first row read by both Pixman and GLES.
     let mapping = renderer.copy_framebuffer(

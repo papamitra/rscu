@@ -1,6 +1,8 @@
 mod control;
 mod focus;
+mod overview;
 mod protocol;
+mod rdp;
 mod render;
 mod session;
 mod window;
@@ -8,7 +10,7 @@ mod window;
 use control::Request;
 use std::{ffi::OsString, path::PathBuf};
 
-const USAGE: &str = "Usage: rscu --socket PATH run [--renderer pixman|gles] [--wayland APP [ARGS...] [--wayland APP ...]] [--x11 APP [ARGS...] ...]
+const USAGE: &str = "Usage: rscu --socket PATH run [--renderer pixman|gles] [--rdp-port PORT] [--wayland APP [ARGS...] [--wayland APP ...]] [--x11 APP [ARGS...] ...]
        rscu --socket PATH windows | activate ID | maximize ID | restore ID | screenshot ID [SINCE] [--crop X Y W H] | click IMAGE X Y | key ID EVDEV [MODIFIER...] | stop";
 
 fn main() {
@@ -45,6 +47,13 @@ fn run() -> session::Result<()> {
             }
             _ => (render::Backend::Pixman, rest),
         };
+        let (rdp_port, remaining) = match args {
+            [flag, value, remaining @ ..] if flag == "--rdp-port" => {
+                (Some(number(value)?), remaining)
+            }
+            _ => (None, args),
+        };
+        args = remaining;
         while let [flag, command @ ..] = args {
             let next = command
                 .iter()
@@ -61,7 +70,7 @@ fn run() -> session::Result<()> {
             }
             args = &command[next..];
         }
-        return session::run(&socket, backend, wayland, x11);
+        return session::run(&socket, backend, rdp_port, wayland, x11);
     }
     let request = match (action.to_str(), rest) {
         (Some("windows"), []) => Request::Windows,

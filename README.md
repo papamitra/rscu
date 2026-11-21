@@ -4,7 +4,7 @@ Rust と Smithay で動く Linux Computer Use 用の専用 Wayland コンポジ�
 
 ## 起動
 
-ビルドには Rust 1.94（検証済み）と Wayland、libxkbcommon、Pixman の開発パッケージが必要です。X11 アプリを使う場合は `Xwayland`、GLES を使う場合は EGL ライブラリと対応ドライバーも必要です。
+ビルドには Rust 1.94（検証済み）と CMake、Wayland、libxkbcommon、Pixman の開発パッケージが必要です。X11 アプリを使う場合は `Xwayland`、GLES を使う場合は EGL ライブラリと対応ドライバーも必要です。
 
 ```sh
 cargo build --target-dir target
@@ -50,3 +50,22 @@ Pixman と GLES で、PNG の画素と部分撮影、複数ウィンドウの切
 検証機では `検証用ディレクトリ` の検証用ビルドで、nanoem の File → Save Project As と File → Open Project を操作しました。もとのラボ版ではファイル選択が無効だったため、検証用コピーで `NANOEM_ENABLE_IMGUI_FILE_DIALOG=ON` に設定しています。このビルドは起動直後にメニューバーが撮影範囲から外れる場合があるため、検証時は最大化してから操作しました。撮影とログは同ディレクトリの `evidence/` にあります。
 
 nanoem のメニューバーの同一領域を５回確認した試験では、通常の撮影は PNG ５枚、画像 ID を指定した場合は PNG １枚と `unchanged` ４件でした。この試験ではモデル入力トークン数を計測していません。
+
+## RDP で閲覧
+
+`run` に `--rdp-port 3390` を付けると、セッションの起動と同時に閲覧専用の RDP サーバーが待ち受けます。アプリのウィンドウをタイルで並べ、AI が操作しているタイルには青い枠を表示します。AI のクリック位置も表示します。
+
+```sh
+target/debug/rscu --socket "$dir/control" run --rdp-port 3390 \
+  --wayland weston-simple-shm --x11 xterm
+```
+
+同じ PC の Remmina では RDP で `127.0.0.1:3390` に接続します。認証画面が出たらユーザー名は `viewer`、パスワードとドメインは空欄で進みます。接続プロファイルの解像度はカスタムの 1280×720、セキュリティは TLS を選びます。証明書はセッションごとに生成されます。待ち受けはループバックに限定しています。
+
+別 PC から見る場合は、手元の PC で SSH トンネルを開いてから Remmina で `127.0.0.1:13390` に接続します。
+
+```sh
+ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:13390:127.0.0.1:3390 rscu-host
+```
+
+初版の表示は 1280×720、最大約 15 FPS、同時接続は１クライアントです。配信には RDP のビットマップ更新を使います。Remmina を閉じても rscu とアプリは起動したままで、再接続できます。

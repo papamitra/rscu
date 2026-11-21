@@ -89,6 +89,7 @@ pub struct Session {
     next_image: u64,
     captures: VecDeque<Capture>,
     pub renderer: Renderer,
+    preview_pointer: Option<(u64, smithay::utils::Point<i32, Logical>, Instant)>,
     capture_dir: PathBuf,
     start: Instant,
     stopped: bool,
@@ -163,6 +164,7 @@ impl Session {
             next_image: 1,
             captures: VecDeque::new(),
             renderer,
+            preview_pointer: None,
             dmabuf,
             capture_dir,
             start: Instant::now(),
@@ -345,6 +347,76 @@ impl Session {
                 .is_some_and(|x| x.is_override_redirect())
     }
 
+    fn family(&self, entry: &Entry) -> Option<u64> {
+        if entry
+            .window
+            .x11_surface()
+            .is_some_and(|x11| x11.is_override_redirect())
+        {
+            entry.popup_owner.map(|owner| self.root(owner))
+        } else {
+            Some(self.root(entry.id))
+        }
+    }
+
+    fn window_location(window: &SceneWindow, child: bool) -> smithay::utils::Point<i32, Logical> {
+        if let Some(x11) = window.x11_surface() {
+            x11.geometry().loc
+        } else if child {
+            let size = window.geometry().size;
+            ((SIZE.0 - size.w).max(0) / 2, (SIZE.1 - size.h).max(0) / 2).into()
+        } else {
+            (0, 0).into()
+        }
+    }
+
+    fn overview(&mut self) -> Result<Vec<u8>> {
+        let mut families = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for entry in self
+            .windows
+            .iter()
+            .filter(|entry| Self::mapped(&entry.window))
+        {
+            if let Some(family) = self.family(entry) {
+                let group = families.entry(family).or_default();
+                let location = self
+                    .space
+                    .element_location(&entry.window)
+                    .unwrap_or_else(|| {
+                        Self::window_location(&entry.window, self.parent(entry).is_some())
+                    });
+                group.push((entry.window.clone(), location));
+            }
+        }
+        let count = families.len();
+        let mut overview = crate::overview::Overview::new(count);
+        let active = self.selected.map(|id| self.root(id));
+        for (index, (family, mut group)) in families.into_iter().enumerate() {
+            if Some(family) == active {
+                group.sort_by_key(|(window, _)| {
+                    self.space.elements().position(|mapped| mapped == window)
+                });
+            }
+            let bounds = group
+                .iter()
+                .map(|(window, location)| {
+                    let mut bounds = window.bbox_with_popups();
+                    bounds.loc += *location - SpaceElement::geometry(window).loc;
+                    bounds
+                })
+                .reduce(Rectangle::merge)
+                .and_then(|area| area.intersection(Rectangle::from_size(SIZE.into())));
+            let Some(area) = bounds else { continue };
+            let pixels = self.renderer.capture_group(&self.output, &group, area)?;
+            let pointer = self
+                .preview_pointer
+                .filter(|(id, _, _)| Some(self.root(*id)) == active && active == Some(family))
+                .map(|(_, point, at)| (point, at.elapsed() < Duration::from_millis(450)));
+            overview.tile(index, area, &pixels, active == Some(family), pointer);
+        }
+        Ok(overview.finish())
+    }
+
     fn refresh(&mut self) {
         self.windows.retain(|entry| entry.window.alive());
         self.associate_legacy_surfaces();
@@ -370,18 +442,7 @@ impl Session {
         let visible: Vec<_> = self
             .windows
             .iter()
-            .filter(|e| {
-                let override_redirect = e
-                    .window
-                    .x11_surface()
-                    .is_some_and(|x| x.is_override_redirect());
-                let root = if override_redirect {
-                    e.popup_owner.map(|owner| self.root(owner))
-                } else {
-                    Some(self.root(e.id))
-                };
-                Self::mapped(&e.window) && family.is_some() && root == family
-            })
+            .filter(|e| Self::mapped(&e.window) && family.is_some() && self.family(e) == family)
             .map(|e| (e.id, e.window.clone(), self.parent(e).is_some()))
             .collect();
 
@@ -398,14 +459,7 @@ impl Session {
             self.space.unmap_elem(&window);
         }
         for (_, window, child) in &visible {
-            let loc = if let Some(x11) = window.x11_surface() {
-                x11.geometry().loc
-            } else if *child {
-                let size = window.geometry().size;
-                ((SIZE.0 - size.w).max(0) / 2, (SIZE.1 - size.h).max(0) / 2).into()
-            } else {
-                (0, 0).into()
-            };
+            let loc = Self::window_location(window, *child);
             if self.space.element_location(window) != Some(loc) {
                 let popup = window
                     .x11_surface()
@@ -595,7 +649,9 @@ impl Session {
         if x < 0 || y < 0 || x >= capture.area.size.w || y >= capture.area.size.h {
             return Err("click is outside the image".into());
         }
-        let position = (capture.area.loc + smithay::utils::Point::from((x, y))).to_f64();
+        let point = capture.area.loc + smithay::utils::Point::from((x, y));
+        let window = capture.window;
+        let position = point.to_f64();
         let focus = self.space.elements().rev().find_map(|window| {
             let location =
                 self.space.element_location(window)? - SpaceElement::geometry(window).loc;
@@ -625,6 +681,7 @@ impl Session {
             ButtonState::Pressed,
             self.epoch,
         ));
+        self.preview_pointer = Some((window, point, Instant::now()));
         self.log(json!({"click":[x,y],"image":image}));
         Ok(json!({"sent":true}))
     }
@@ -753,6 +810,7 @@ impl Drop for Session {
 pub fn run(
     socket: &Path,
     backend: Backend,
+    rdp_port: Option<u16>,
     mut apps: Vec<Vec<OsString>>,
     mut x11: Vec<Vec<OsString>>,
 ) -> Result<()> {
@@ -763,6 +821,7 @@ pub fn run(
     let socket_guard = SocketGuard(socket.to_path_buf());
     control.set_nonblocking(true)?;
     std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    let mut preview = rdp_port.map(crate::rdp::Preview::start).transpose()?;
     let capture_dir = dir.path().to_path_buf();
     let mut display = Display::<Session>::new()?;
     let mut event_loop = EventLoop::<Session>::try_new()?;
@@ -865,8 +924,18 @@ pub fn run(
             .children
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         state.frame();
+        if !state.stopped
+            && let Some(preview) = &mut preview
+            && preview.frame_due()
+        {
+            match state.overview() {
+                Ok(pixels) => preview.publish(pixels),
+                Err(error) => eprintln!("RDP preview capture: {error}"),
+            }
+        }
         display.flush_clients()?;
     }
+    drop(preview);
     drop(state);
     drop(xserver);
     drop(event_loop);
