@@ -5,6 +5,25 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseButton {
+    #[default]
+    Left,
+    Right,
+    Middle,
+}
+
+impl MouseButton {
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Left => 0x110,
+            Self::Right => 0x111,
+            Self::Middle => 0x112,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
@@ -23,10 +42,33 @@ pub enum Request {
         since: Option<u64>,
         crop: Option<[i32; 4]>,
     },
+    Move {
+        image: u64,
+        x: i32,
+        y: i32,
+    },
     Click {
         image: u64,
         x: i32,
         y: i32,
+        #[serde(default)]
+        button: MouseButton,
+        #[serde(default)]
+        double: bool,
+    },
+    Scroll {
+        image: u64,
+        x: i32,
+        y: i32,
+        horizontal: i32,
+        vertical: i32,
+    },
+    Drag {
+        image: u64,
+        x: i32,
+        y: i32,
+        end_x: i32,
+        end_y: i32,
     },
     Key {
         window: u64,

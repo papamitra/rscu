@@ -143,6 +143,67 @@ def check_input(ctl, directory):
     assert (directory / "xterm-input").read_text() == "A\n"
 
 
+def mouse_apps(directory, backend):
+    apps = [
+        backend, "env", f"GDK_BACKEND={backend[2:]}",
+        sys.executable, str(HERE / "mouse_client.py"), str(directory / "mouse-events"),
+    ]
+    if backend == "--x11":
+        apps += [
+            "--x11", "sh", "-c", 'exec stdbuf -oL xev -name rscu-wheel -event button > "$1"',
+            "sh", str(directory / "wheel-events"),
+        ]
+    return apps
+
+
+def lookup_window(ctl, title):
+    return wait_for(lambda: next((w["id"] for w in ctl("windows") if w["title"] == title), None))
+
+
+def check_mouse(ctl, directory, backend):
+    window = lookup_window(ctl, "rscu-mouse")
+    ctl("activate", window)
+    image = ctl("screenshot", window)["image"]
+    log = directory / "mouse-events"
+
+    def events():
+        return [line.split() for line in log.read_text().splitlines()] if log.exists() else []
+
+    ctl("move", image, 80, 85)
+    wait_for(lambda: ["motion", "80", "85"] in events())
+    assert not any(kind == "press" for kind, *_ in events())
+
+    ctl("click", image, 65, 65, "right")
+    ctl("click", image, 90, 65, "middle")
+    ctl("double-click", image, 135, 85)
+    for button, count in [("3", "1"), ("2", "1"), ("1", "2")]:
+        wait_for(lambda: ["press", button, count] in events())
+
+    if backend == "--wayland":
+        ctl("scroll", image, 120, 100, 2, -3)
+        wait_for(lambda: any(kind == "scroll" and float(x) > 0 for kind, x, _ in events()))
+        wait_for(lambda: any(kind == "scroll" and float(y) < 0 for kind, _, y in events()))
+
+    ctl("drag", image, 50, 65, 190, 145)
+    wait_for(lambda: ["drag", "140", "80"] in events())
+    assert any(kind == "motion" and 50 < int(x) < 190 and 65 < int(y) < 145
+               for kind, x, y in events())
+    ctl("drag", image, 50, 65, 500, 145, error="outside the image")
+    ctl("scroll", image, 120, 100, 0, 0, error="nonzero wheel steps")
+    assert ["drag", "140", "80"] in events()
+
+    if backend == "--x11":
+        # Check legacy X11 wheel buttons directly, including their step counts.
+        wheel = lookup_window(ctl, "rscu-wheel")
+        ctl("activate", wheel)
+        image = ctl("screenshot", wheel)["image"]
+        ctl("scroll", image, 55, 50, 2, -3)
+        log = directory / "wheel-events"
+        wait_for(lambda: log.read_text().count("button 4,") >= 6)
+        output = log.read_text()
+        assert output.count("button 7,") == 4 and output.count("button 4,") == 6, output
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=Path("target/debug/rscu"))
@@ -157,7 +218,12 @@ def main():
             args.binary.resolve(), args.renderer,
             lambda directory: input_apps(directory, backend), check_input,
         )
-        print(f"Passed {args.renderer} pixel and {backend[2:]} input checks")
+        run_session(
+            args.binary.resolve(), args.renderer,
+            lambda directory: mouse_apps(directory, backend),
+            lambda ctl, directory: check_mouse(ctl, directory, backend),
+        )
+        print(f"Passed {args.renderer} pixel and {backend[2:]} keyboard and mouse checks")
 
 
 if __name__ == "__main__":

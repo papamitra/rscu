@@ -34,16 +34,29 @@ rmdir "$dir"
 
 例の ID は実際の応答に合わせてください。`screenshot` は画像 ID、PNG のパス、寸法、現在のフォーカスを返します。直前の画像 ID を指定して同じ領域を撮ると、変化がなければ `unchanged: true` が返ります。クリック座標は指定した画像の左上が原点です。キーコードは Linux の evdev 番号です。修飾キーは末尾に追加できます。例として `ctl key 1 24 29` は Ctrl+O を送ります。PNG と `actions.jsonl` はセッション中に一時ディレクトリから確認できます。残す場合は停止前にコピーしてください。
 
+### マウス操作
+
+```sh
+ctl move 1 30 40
+ctl click 1 30 40 right
+ctl click 1 30 40 middle
+ctl double-click 1 30 40
+ctl scroll 1 30 40 0 -3
+ctl drag 1 30 40 220 160
+```
+
+座標は画像 ID の PNG を基準にします。部分撮影の画像では切り出し領域の左上が原点です。スクロールの最後の２引数は横・縦のホイール段数で、正は右・下、負は左・上です。移動は１回の座標更新で、ドラッグは中間座標を送ります。ドラッグ中に対象が変わるとボタンを解放して中断します。
+
 ## 検証
 
-GTK 4 の Python バインディング、Pillow、xterm、Xwayland がある環境では、次の操作テストを実行できます。
+GTK 4 の Python バインディング、Pillow、xterm、xev、Xwayland がある環境では、次の操作テストを実行できます。
 
 ```sh
 python3 tests/smoke.py
 python3 tests/smoke.py --renderer gles
 ```
 
-Pixman と GLES で、PNG の画素と部分撮影、複数ウィンドウの切り替え、最大化と復元、Wayland と X11 のメニューとモーダル、キー入力、停止時のソケット削除を検証しました。
+Pixman と GLES で、PNG の画素と部分撮影、複数ウィンドウの切り替え、最大化と復元、Wayland と X11 のメニューとモーダル、キーとマウス入力、停止時のソケット削除を検証しました。
 
 検証機の Ubuntu 22.04 と XWayland 22.1.1 では、NVIDIA RTX 6000 Ada での GLES 合成と、専用 XWayland での NVIDIA GLX を確認しました。nanoem の起動、PNG 撮影、最大化と復元、指定座標へのクリック、対象ウィンドウへのキーイベントまで確認しました。検証前後で通常デスクトップのアクティブウィンドウ ID は同じでした。
 

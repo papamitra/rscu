@@ -1,20 +1,21 @@
 use crate::{
-    control::{self, Request},
+    control::{self, MouseButton, Request},
     focus::KeyboardFocus,
+    mouse::{self, Action as MouseAction},
     render::{Backend, Renderer},
     window::SceneWindow,
 };
 use serde_json::{Value, json};
 use smithay::{
     backend::{
-        input::{ButtonState, KeyState},
+        input::{Axis, AxisSource, ButtonState, KeyState},
         renderer::buffer_dimensions,
     },
     desktop::{PopupManager, Space, Window, space::SpaceElement},
     input::{
         Seat, SeatState,
         keyboard::FilterResult,
-        pointer::{ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
@@ -23,7 +24,7 @@ use smithay::{
             Client, Display, DisplayHandle, ListeningSocket, protocol::wl_surface::WlSurface,
         },
     },
-    utils::{IsAlive, Logical, Rectangle, SERIAL_COUNTER, Transform},
+    utils::{IsAlive, Logical, Point, Rectangle, SERIAL_COUNTER, Transform},
     wayland::{
         compositor::{CompositorState, with_states},
         output::OutputManagerState,
@@ -90,11 +91,11 @@ pub struct Session {
     captures: VecDeque<Capture>,
     pub renderer: Renderer,
     #[cfg(feature = "rdp")]
-    preview_pointer: Option<(u64, smithay::utils::Point<i32, Logical>, Instant)>,
+    preview_pointer: Option<(u64, Point<i32, Logical>, Option<Instant>)>,
     capture_dir: PathBuf,
     start: Instant,
     stopped: bool,
-    click_step: Option<(Instant, ButtonState, u64)>,
+    mouse_sequence: Option<mouse::Sequence>,
     children: Vec<Child>,
 }
 
@@ -171,7 +172,7 @@ impl Session {
             capture_dir,
             start: Instant::now(),
             stopped: false,
-            click_step: None,
+            mouse_sequence: None,
             children: Vec::new(),
         })
     }
@@ -442,7 +443,12 @@ impl Session {
             let pointer = self
                 .preview_pointer
                 .filter(|(id, _, _)| Some(self.root(*id)) == active && active == Some(family))
-                .map(|(_, point, at)| (point, at.elapsed() < Duration::from_millis(450)));
+                .map(|(_, point, at)| {
+                    (
+                        point,
+                        at.is_some_and(|at| at.elapsed() < Duration::from_millis(450)),
+                    )
+                });
             overview.tile(
                 index,
                 crate::overview::Target::Window(family),
@@ -523,6 +529,13 @@ impl Session {
     fn focus(&mut self, target: Option<u64>) {
         if self.focused == target {
             return;
+        }
+        if let Some(button) = self
+            .mouse_sequence
+            .as_mut()
+            .and_then(|sequence| sequence.held.take())
+        {
+            self.button(button, ButtonState::Released);
         }
         let serial = SERIAL_COUNTER.next_serial();
         let time = self.start.elapsed().as_millis() as u32;
@@ -672,24 +685,62 @@ impl Session {
         )
     }
 
-    fn click(&mut self, image: u64, x: i32, y: i32) -> Result<Value> {
+    fn mouse(&mut self, image: u64, x: i32, y: i32, mut action: MouseAction) -> Result<Value> {
         let capture = self
             .captures
             .iter()
             .find(|capture| capture.id == image)
             .ok_or("unknown image")?;
-        if capture.epoch != self.epoch || self.area(capture.window)? != capture.window_area {
+        let window = capture.window;
+        let window_area = capture.window_area;
+        if capture.epoch != self.epoch || self.area(window)? != window_area {
             return Err("stale image; take another screenshot".into());
         }
-        if self.focused != Some(capture.window) {
-            return Err("capture the focused window before clicking".into());
+        if self.focused != Some(window) {
+            return Err("capture the focused window before sending pointer input".into());
         }
-        if x < 0 || y < 0 || x >= capture.area.size.w || y >= capture.area.size.h {
-            return Err("click is outside the image".into());
+        let absolute = |local: Point<i32, Logical>| {
+            Rectangle::from_size(capture.area.size)
+                .contains(local)
+                .then(|| capture.area.loc + local)
+                .ok_or("pointer coordinates are outside the image")
+        };
+        let log = match &action {
+            MouseAction::Move => json!({"command":"move","image":image,"x":x,"y":y}),
+            MouseAction::Click { button, double } => {
+                json!({"click":[x,y],"image":image,"button":button,"double":double})
+            }
+            MouseAction::Scroll {
+                horizontal,
+                vertical,
+            } => json!({
+                "command":"scroll","image":image,"x":x,"y":y,"horizontal":horizontal,"vertical":vertical,
+            }),
+            MouseAction::Drag { end } => {
+                json!({"command":"drag","image":image,"x":x,"y":y,"end_x":end.x,"end_y":end.y})
+            }
+        };
+        let point = absolute((x, y).into())?;
+        if let MouseAction::Drag { end } = &mut action {
+            *end = absolute(*end)?;
         }
-        let point = capture.area.loc + smithay::utils::Point::from((x, y));
-        #[cfg(feature = "rdp")]
-        let window = capture.window;
+        if let MouseAction::Scroll {
+            horizontal,
+            vertical,
+        } = &action
+            && (!(-64..=64).contains(horizontal)
+                || !(-64..=64).contains(vertical)
+                || (*horizontal == 0 && *vertical == 0))
+        {
+            return Err("scroll expects nonzero wheel steps between -64 and 64".into());
+        }
+        self.move_pointer(window, point)?;
+        self.mouse_sequence = mouse::Sequence::new(action, point, self.epoch, window, window_area);
+        self.log(log);
+        Ok(json!({"sent":true}))
+    }
+
+    fn move_pointer(&mut self, _window: u64, point: Point<i32, Logical>) -> Result<()> {
         let position = point.to_f64();
         let focus = self.space.elements().rev().find_map(|window| {
             let location =
@@ -698,48 +749,104 @@ impl Session {
                 .surface_under(position - location.to_f64())
                 .map(|(surface, offset)| (surface, (offset + location).to_f64()))
         });
-        let pointer = self.seat.get_pointer().unwrap();
+        let pointer = self.seat.get_pointer().expect("virtual pointer");
         if focus.is_none() && !pointer.is_grabbed() {
             return Err("no input surface at this position".into());
         }
-        let time = self.start.elapsed().as_millis() as u32;
         pointer.motion(
             self,
             focus,
             &MotionEvent {
                 location: position,
                 serial: SERIAL_COUNTER.next_serial(),
-                time,
+                time: self.start.elapsed().as_millis() as u32,
             },
         );
         pointer.frame(self);
-        // XWayland must process the motion before the button event. Keep the
-        // button pressed across a client frame for immediate-mode toolkits.
-        self.click_step = Some((
-            Instant::now() + Duration::from_millis(16),
-            ButtonState::Pressed,
-            self.epoch,
-        ));
         #[cfg(feature = "rdp")]
         {
-            self.preview_pointer = Some((window, point, Instant::now()));
+            self.preview_pointer = Some((_window, point, None));
         }
-        self.log(json!({"click":[x,y],"image":image}));
-        Ok(json!({"sent":true}))
+        Ok(())
     }
 
-    fn left_button(&mut self, state: ButtonState) {
+    fn button(&mut self, button: MouseButton, state: ButtonState) {
         let pointer = self.seat.get_pointer().expect("virtual pointer");
         pointer.button(
             self,
             &ButtonEvent {
                 serial: SERIAL_COUNTER.next_serial(),
                 time: self.start.elapsed().as_millis() as u32,
-                button: 0x110,
+                button: button.code(),
                 state,
             },
         );
         pointer.frame(self);
+    }
+
+    fn scroll(&mut self, horizontal: i32, vertical: i32) {
+        let pointer = self.seat.get_pointer().expect("virtual pointer");
+        let mut frame =
+            AxisFrame::new(self.start.elapsed().as_millis() as u32).source(AxisSource::Wheel);
+        for (axis, steps) in [(Axis::Horizontal, horizontal), (Axis::Vertical, vertical)] {
+            if steps != 0 {
+                frame = frame
+                    .value(axis, f64::from(steps) * 15.0)
+                    .v120(axis, steps * 120);
+            }
+        }
+        pointer.axis(self, frame);
+        pointer.frame(self);
+    }
+
+    fn advance_mouse(&mut self) -> Result<()> {
+        let Some(mut sequence) = self.mouse_sequence.take() else {
+            return Ok(());
+        };
+        if sequence.epoch != self.epoch
+            || self.area(sequence.window).ok() != Some(sequence.window_area)
+        {
+            if let Some(button) = sequence.held.take() {
+                self.button(button, ButtonState::Released);
+            }
+            return if sequence.only_release_left() {
+                Ok(())
+            } else {
+                Err("target changed during pointer operation; take another screenshot".into())
+            };
+        }
+        match sequence.next() {
+            Some(mouse::Event::Press(button)) => {
+                self.button(button, ButtonState::Pressed);
+                sequence.held = Some(button);
+                #[cfg(feature = "rdp")]
+                if let Some((_, _, at)) = &mut self.preview_pointer {
+                    *at = Some(Instant::now());
+                }
+            }
+            Some(mouse::Event::Release) => {
+                if let Some(button) = sequence.held.take() {
+                    self.button(button, ButtonState::Released);
+                }
+            }
+            Some(mouse::Event::Move(point)) => {
+                if let Err(error) = self.move_pointer(sequence.window, point) {
+                    if let Some(button) = sequence.held.take() {
+                        self.button(button, ButtonState::Released);
+                    }
+                    return Err(error);
+                }
+            }
+            Some(mouse::Event::Scroll {
+                horizontal,
+                vertical,
+            }) => self.scroll(horizontal, vertical),
+            None => {}
+        }
+        if !sequence.complete() {
+            self.mouse_sequence = Some(sequence);
+        }
+        Ok(())
     }
 
     fn key(&mut self, window: u64, code: u32, modifiers: Vec<u32>) -> Result<Value> {
@@ -826,7 +933,43 @@ impl Session {
                 since,
                 crop,
             } => self.screenshot(window, since, crop),
-            Request::Click { image, x, y } => self.click(image, x, y),
+            Request::Move { image, x, y } => self.mouse(image, x, y, MouseAction::Move),
+            Request::Click {
+                image,
+                x,
+                y,
+                button,
+                double,
+            } => self.mouse(image, x, y, MouseAction::Click { button, double }),
+            Request::Scroll {
+                image,
+                x,
+                y,
+                horizontal,
+                vertical,
+            } => self.mouse(
+                image,
+                x,
+                y,
+                MouseAction::Scroll {
+                    horizontal,
+                    vertical,
+                },
+            ),
+            Request::Drag {
+                image,
+                x,
+                y,
+                end_x,
+                end_y,
+            } => self.mouse(
+                image,
+                x,
+                y,
+                MouseAction::Drag {
+                    end: (end_x, end_y).into(),
+                },
+            ),
             Request::Key {
                 window,
                 code,
@@ -894,10 +1037,17 @@ pub fn run(
     let xwayland_deadline = Instant::now() + Duration::from_secs(15);
     eprintln!("Wayland socket: {}", wayland_path.display());
     eprintln!("Control socket: {}", socket.display());
-    let mut click_reply: Option<(UnixStream, Value)> = None;
+    let mut mouse_reply: Option<(UnixStream, Value)> = None;
     let mut stop_reply = None;
     while !state.stopped {
-        event_loop.dispatch(Duration::from_millis(16), &mut state)?;
+        let poll_interval = Duration::from_millis(16);
+        let wait = state
+            .mouse_sequence
+            .as_ref()
+            .map_or(poll_interval, |sequence| {
+                poll_interval.min(sequence.time_until_step())
+            });
+        event_loop.dispatch(wait, &mut state)?;
         while let Some(client) = listener.accept()? {
             state
                 .dh
@@ -927,31 +1077,17 @@ pub fn run(
         }
 
         state.refresh();
-        if let Some((deadline, button, epoch)) = state.click_step
-            && Instant::now() >= deadline
+        if let Err(error) = state.advance_mouse()
+            && let Some((_, response)) = &mut mouse_reply
         {
-            state.click_step = None;
-            if button == ButtonState::Pressed && state.epoch != epoch {
-                if let Some((_, response)) = &mut click_reply {
-                    *response = json!({"error":"target changed during pointer motion; take another screenshot"});
-                }
-            } else {
-                state.left_button(button);
-                if button == ButtonState::Pressed {
-                    state.click_step = Some((
-                        Instant::now() + Duration::from_millis(45),
-                        ButtonState::Released,
-                        epoch,
-                    ));
-                }
-            }
+            *response = json!({"error": error.to_string()});
         }
-        if state.click_step.is_none()
-            && let Some((stream, response)) = click_reply.take()
+        if state.mouse_sequence.is_none()
+            && let Some((stream, response)) = mouse_reply.take()
         {
             let _ = serde_json::to_writer(stream, &response);
         }
-        if click_reply.is_none()
+        if mouse_reply.is_none()
             && let Ok((stream, _)) = control.accept()
         {
             control::configure(&stream)?;
@@ -961,8 +1097,8 @@ pub fn run(
                 .unwrap_or_else(|error| json!({"error":error.to_string()}));
             if state.stopped {
                 stop_reply = Some((stream, response));
-            } else if state.click_step.is_some() {
-                click_reply = Some((stream, response));
+            } else if state.mouse_sequence.is_some() {
+                mouse_reply = Some((stream, response));
             } else {
                 let _ = serde_json::to_writer(stream, &response);
             }

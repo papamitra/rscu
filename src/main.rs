@@ -1,5 +1,6 @@
 mod control;
 mod focus;
+mod mouse;
 #[cfg(feature = "rdp")]
 mod overview;
 mod protocol;
@@ -9,11 +10,11 @@ mod render;
 mod session;
 mod window;
 
-use control::Request;
+use control::{MouseButton, Request};
 use std::{ffi::OsString, path::PathBuf};
 
 const USAGE: &str = "Usage: rscu --socket PATH run [--renderer pixman|gles] [--rdp-port PORT] [--wayland APP [ARGS...] [--wayland APP ...]] [--x11 APP [ARGS...] ...]
-       rscu --socket PATH windows | activate ID | maximize ID | restore ID | screenshot ID [SINCE] [--crop X Y W H] | click IMAGE X Y | key ID EVDEV [MODIFIER...] | stop";
+       rscu --socket PATH windows | activate ID | maximize ID | restore ID | screenshot ID [SINCE] [--crop X Y W H] | move IMAGE X Y | click IMAGE X Y [left|right|middle] | double-click IMAGE X Y | scroll IMAGE X Y H V | drag IMAGE X Y END_X END_Y | key ID EVDEV [MODIFIER...] | stop";
 
 fn main() {
     if let Err(error) = run() {
@@ -104,10 +105,44 @@ fn run() -> session::Result<()> {
                 crop,
             }
         }
-        (Some("click"), [image, x, y]) => Request::Click {
+        (Some("move"), [image, x, y]) => Request::Move {
             image: number(image)?,
             x: number(x)?,
             y: number(y)?,
+        },
+        (Some("click"), [image, x, y, options @ ..]) => Request::Click {
+            image: number(image)?,
+            x: number(x)?,
+            y: number(y)?,
+            button: match options {
+                [] => MouseButton::Left,
+                [b] if b == "left" => MouseButton::Left,
+                [b] if b == "right" => MouseButton::Right,
+                [b] if b == "middle" => MouseButton::Middle,
+                _ => return Err(USAGE.into()),
+            },
+            double: false,
+        },
+        (Some("double-click"), [image, x, y]) => Request::Click {
+            image: number(image)?,
+            x: number(x)?,
+            y: number(y)?,
+            button: MouseButton::Left,
+            double: true,
+        },
+        (Some("scroll"), [image, x, y, horizontal, vertical]) => Request::Scroll {
+            image: number(image)?,
+            x: number(x)?,
+            y: number(y)?,
+            horizontal: number(horizontal)?,
+            vertical: number(vertical)?,
+        },
+        (Some("drag"), [image, x, y, end_x, end_y]) => Request::Drag {
+            image: number(image)?,
+            x: number(x)?,
+            y: number(y)?,
+            end_x: number(end_x)?,
+            end_y: number(end_y)?,
         },
         (Some("key"), [window, code, modifiers @ ..]) => Request::Key {
             window: number(window)?,
