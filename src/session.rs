@@ -89,6 +89,7 @@ pub struct Session {
     next_image: u64,
     captures: VecDeque<Capture>,
     pub renderer: Renderer,
+    #[cfg(feature = "rdp")]
     preview_pointer: Option<(u64, smithay::utils::Point<i32, Logical>, Instant)>,
     capture_dir: PathBuf,
     start: Instant,
@@ -164,6 +165,7 @@ impl Session {
             next_image: 1,
             captures: VecDeque::new(),
             renderer,
+            #[cfg(feature = "rdp")]
             preview_pointer: None,
             dmabuf,
             capture_dir,
@@ -319,8 +321,8 @@ impl Session {
         })
     }
 
-    fn info(&self, entry: &Entry) -> Value {
-        let title = if let Some(x11) = entry.window.x11_surface() {
+    fn window_title(entry: &Entry) -> Option<String> {
+        if let Some(x11) = entry.window.x11_surface() {
             Some(x11.title())
         } else {
             entry.window.surface().and_then(|surface| {
@@ -334,8 +336,11 @@ impl Session {
                         .clone()
                 })
             })
-        };
-        json!({"id":entry.id,"title":title.unwrap_or_default(),"focused":self.focused == Some(entry.id),
+        }
+    }
+
+    fn info(&self, entry: &Entry) -> Value {
+        json!({"id":entry.id,"title":Self::window_title(entry).unwrap_or_default(),"focused":self.focused == Some(entry.id),
             "parent":self.parent(entry),"modal":self.modal(entry)})
     }
 
@@ -370,7 +375,11 @@ impl Session {
         }
     }
 
-    fn overview(&mut self) -> Result<Vec<u8>> {
+    #[cfg(feature = "rdp")]
+    fn overview(
+        &mut self,
+        requested: Option<u64>,
+    ) -> Result<(Option<u64>, crate::overview::Frame)> {
         let mut families = std::collections::BTreeMap::<_, Vec<_>>::new();
         for entry in self
             .windows
@@ -388,9 +397,31 @@ impl Session {
                 group.push((entry.window.clone(), location));
             }
         }
-        let count = families.len();
-        let mut overview = crate::overview::Overview::new(count);
+        let expanded =
+            requested.filter(|id| families.contains_key(id) && self.entry(*id).is_some());
         let active = self.selected.map(|id| self.root(id));
+        let title = |id| {
+            let title = self
+                .entry(id)
+                .and_then(Self::window_title)
+                .unwrap_or_default();
+            format!("#{id} {title}")
+        };
+        let label = expanded.map(title);
+        let active_label = if active == expanded {
+            "AI: here".to_string()
+        } else {
+            active
+                .map(|id| format!("AI: {}", title(id)))
+                .unwrap_or_else(|| "AI: idle".into())
+        };
+        if let Some(id) = expanded {
+            families.retain(|family, _| *family == id);
+        }
+        let mut overview = crate::overview::Overview::new(
+            families.len(),
+            label.as_deref().map(|label| (label, active_label.as_str())),
+        );
         for (index, (family, mut group)) in families.into_iter().enumerate() {
             if Some(family) == active {
                 group.sort_by_key(|(window, _)| {
@@ -412,9 +443,16 @@ impl Session {
                 .preview_pointer
                 .filter(|(id, _, _)| Some(self.root(*id)) == active && active == Some(family))
                 .map(|(_, point, at)| (point, at.elapsed() < Duration::from_millis(450)));
-            overview.tile(index, area, &pixels, active == Some(family), pointer);
+            overview.tile(
+                index,
+                crate::overview::Target::Window(family),
+                area,
+                &pixels,
+                active == Some(family),
+                pointer,
+            );
         }
-        Ok(overview.finish())
+        Ok((expanded, overview.finish()))
     }
 
     fn refresh(&mut self) {
@@ -650,6 +688,7 @@ impl Session {
             return Err("click is outside the image".into());
         }
         let point = capture.area.loc + smithay::utils::Point::from((x, y));
+        #[cfg(feature = "rdp")]
         let window = capture.window;
         let position = point.to_f64();
         let focus = self.space.elements().rev().find_map(|window| {
@@ -681,7 +720,10 @@ impl Session {
             ButtonState::Pressed,
             self.epoch,
         ));
-        self.preview_pointer = Some((window, point, Instant::now()));
+        #[cfg(feature = "rdp")]
+        {
+            self.preview_pointer = Some((window, point, Instant::now()));
+        }
         self.log(json!({"click":[x,y],"image":image}));
         Ok(json!({"sent":true}))
     }
@@ -814,6 +856,10 @@ pub fn run(
     mut apps: Vec<Vec<OsString>>,
     mut x11: Vec<Vec<OsString>>,
 ) -> Result<()> {
+    #[cfg(not(feature = "rdp"))]
+    if rdp_port.is_some() {
+        return Err("this rscu build has no RDP support; enable the rdp feature".into());
+    }
     let dir = tempfile::Builder::new().prefix("rscu-").tempdir()?;
     let wayland_path = dir.path().join("wayland");
     let listener = ListeningSocket::bind_absolute(wayland_path.clone())?;
@@ -821,6 +867,7 @@ pub fn run(
     let socket_guard = SocketGuard(socket.to_path_buf());
     control.set_nonblocking(true)?;
     std::fs::set_permissions(socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+    #[cfg(feature = "rdp")]
     let mut preview = rdp_port.map(crate::rdp::Preview::start).transpose()?;
     let capture_dir = dir.path().to_path_buf();
     let mut display = Display::<Session>::new()?;
@@ -924,17 +971,20 @@ pub fn run(
             .children
             .retain_mut(|child| !matches!(child.try_wait(), Ok(Some(_))));
         state.frame();
+        #[cfg(feature = "rdp")]
         if !state.stopped
             && let Some(preview) = &mut preview
             && preview.frame_due()
         {
-            match state.overview() {
-                Ok(pixels) => preview.publish(pixels),
+            let requested = preview.selected();
+            match state.overview(requested) {
+                Ok((shown, frame)) => preview.publish(requested, shown, frame),
                 Err(error) => eprintln!("RDP preview capture: {error}"),
             }
         }
         display.flush_clients()?;
     }
+    #[cfg(feature = "rdp")]
     drop(preview);
     drop(state);
     drop(xserver);

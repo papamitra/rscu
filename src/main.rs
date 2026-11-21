@@ -1,7 +1,9 @@
 mod control;
 mod focus;
+#[cfg(feature = "rdp")]
 mod overview;
 mod protocol;
+#[cfg(feature = "rdp")]
 mod rdp;
 mod render;
 mod session;

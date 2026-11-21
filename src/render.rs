@@ -2,6 +2,8 @@ use crate::{
     session::{Result, SIZE, Session},
     window::SceneWindow,
 };
+#[cfg(feature = "rdp")]
+use smithay::{backend::renderer::element::AsRenderElements, utils::Point};
 use smithay::{
     backend::{
         allocator::{Fourcc, dmabuf::Dmabuf},
@@ -9,7 +11,7 @@ use smithay::{
         renderer::{
             ExportMem, ImportAll, ImportDma, ImportEgl, Offscreen, Texture,
             damage::OutputDamageTracker,
-            element::{AsRenderElements, surface::WaylandSurfaceRenderElement},
+            element::surface::WaylandSurfaceRenderElement,
             gles::{GlesRenderbuffer, GlesRenderer, ffi},
             pixman::PixmanRenderer,
         },
@@ -17,7 +19,7 @@ use smithay::{
     desktop::{Space, space::render_output},
     output::Output,
     reexports::wayland_server::DisplayHandle,
-    utils::{Logical, Point, Rectangle},
+    utils::{Logical, Rectangle},
     wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState},
 };
 use std::{ffi::CStr, os::unix::fs::MetadataExt, path::PathBuf};
@@ -140,6 +142,7 @@ impl Renderer {
             ),
         }
     }
+    #[cfg(feature = "rdp")]
     pub fn capture_group(
         &mut self,
         output: &Output,
@@ -167,6 +170,7 @@ impl Renderer {
 
 enum Scene<'a> {
     Active(&'a Space<SceneWindow>),
+    #[cfg(feature = "rdp")]
     Group(&'a [(SceneWindow, Point<i32, Logical>)]),
 }
 
@@ -201,6 +205,7 @@ where
             )?
             .sync
         }
+        #[cfg(feature = "rdp")]
         Scene::Group(group) => {
             let elements: Vec<WaylandSurfaceRenderElement<R>> = group
                 .iter()
