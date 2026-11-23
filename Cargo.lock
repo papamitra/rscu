@@ -2618,12 +2618,29 @@ dependencies = [
  "ironrdp-server",
  "png",
  "rcgen",
- "serde",
+ "rscu-control",
  "serde_json",
  "smithay",
  "tempfile",
  "tokio",
  "x11rb",
+]
+
+[[package]]
+name = "rscu-control"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "rscu-mcp"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rscu-control",
+ "serde_json",
 ]
 
 [[package]]

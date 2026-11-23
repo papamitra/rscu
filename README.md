@@ -47,6 +47,22 @@ ctl drag 1 30 40 220 160
 
 座標は画像 ID の PNG を基準にします。部分撮影の画像では切り出し領域の左上が原点です。スクロールの最後の２引数は横・縦のホイール段数で、正は右・下、負は左・上です。移動は１回の座標更新で、ドラッグは中間座標を送ります。ドラッグ中に対象が変わるとボタンを解放して中断します。
 
+## MCP で操作する
+
+`crates/rscu-mcp` は stdio の MCP サーバーです。`crates/rscu-control` の操作 API を使い、起動済みの rscu に Unix ソケットで接続します。初版は MCP サーバー1プロセスにつき、`--socket` で指定した rscu セッション1つを操作します。
+
+```sh
+cargo build --target-dir target -p rscu-mcp
+```
+
+DeepSeekHarness では、ローカルの stdio サーバーとして起動コマンドに `<リポジトリの絶対パス>/target/debug/rscu-mcp`、引数に `["--socket", "<rscu の操作ソケットの絶対パス>"]` を指定します。Harness 側と rscu は同じマシンで実行します。上の起動例に続けて Codex に登録する場合は、次のコマンドを使います。
+
+```sh
+codex mcp add rscu -- "$PWD/target/debug/rscu-mcp" --socket "$dir/control"
+```
+
+`windows` でウィンドウ ID を取得し、`screenshot` で PNG と画像 ID を受け取ります。`click` などのマウス操作には画像 ID と画像内の座標を渡します。撮影時に前回の画像 ID を `since` に指定すると、変化がない場合はメタデータだけを返します。`crop` で撮影範囲も指定できます。
+
 ## 検証
 
 GTK 4 の Python バインディング、Pillow、xterm、xev、Xwayland がある環境では、次の操作テストを実行できます。
@@ -54,6 +70,7 @@ GTK 4 の Python バインディング、Pillow、xterm、xev、Xwayland があ�
 ```sh
 python3 tests/smoke.py
 python3 tests/smoke.py --renderer gles
+python3 tests/mcp.py
 ```
 
 Pixman と GLES で、PNG の画素と部分撮影、複数ウィンドウの切り替え、最大化と復元、Wayland と X11 のメニューとモーダル、キーとマウス入力、停止時のソケット削除を検証しました。

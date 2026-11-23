@@ -1,4 +1,4 @@
-mod control;
+use rscu_control as control;
 mod focus;
 mod mouse;
 #[cfg(feature = "rdp")]

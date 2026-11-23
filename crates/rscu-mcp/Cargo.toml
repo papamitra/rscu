@@ -1,0 +1,9 @@
+[package]
+name = "rscu-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+base64 = "0.22"
+rscu-control = { path = "../rscu-control" }
+serde_json = "1"
